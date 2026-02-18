@@ -31,14 +31,43 @@ const DREAMCORD_ADMIN_PASSWORD = String(process.env.DREAMCORD_ADMIN_PASSWORD || 
 const DREAMCORD_ADMIN_2FA = String(process.env.DREAMCORD_ADMIN_2FA || '').trim();
 const SILLYTAVERN_BASE_URL = String(process.env.SILLYTAVERN_BASE_URL || '').replace(/\/$/, '');
 const SILLYTAVERN_API_KEY = String(process.env.SILLYTAVERN_API_KEY || '').trim();
+const SILLYTAVERN_USERNAME = String(process.env.SILLYTAVERN_USERNAME || '').trim();
+const SILLYTAVERN_PASSWORD = String(process.env.SILLYTAVERN_PASSWORD || '');
 const SILLYTAVERN_CHARACTERS_URL = String(process.env.SILLYTAVERN_CHARACTERS_URL || '').trim();
 const DEFAULT_TARGET_CHANNEL_ID = String(process.env.DEFAULT_TARGET_CHANNEL_ID || '').trim();
 const DEFAULT_SOURCE_LABEL = String(process.env.DEFAULT_SOURCE_TAG || 'sillytavern').trim().slice(0, 40) || 'sillytavern';
 
 let adminSessionCookie = '';
+let stSessionCookie = '';
+let stCsrfToken = '';
 
 function hasBridgeConfig() {
-  return !!(DREAMCORD_BASE_URL && SILLYTAVERN_BASE_URL && SILLYTAVERN_API_KEY && DREAMCORD_ADMIN_USERNAME && DREAMCORD_ADMIN_PASSWORD);
+  return !!(DREAMCORD_BASE_URL && SILLYTAVERN_BASE_URL && DREAMCORD_ADMIN_USERNAME && DREAMCORD_ADMIN_PASSWORD);
+}
+
+async function ensureStSession() {
+  if (stSessionCookie && stCsrfToken) return;
+  // Get CSRF token
+  const csrfRes = await fetch(`${SILLYTAVERN_BASE_URL}/csrf-token`);
+  if (!csrfRes.ok) throw new Error(`ST CSRF fetch failed: ${csrfRes.status}`);
+  const csrfData = await csrfRes.json();
+  stCsrfToken = csrfData.token || '';
+  const initCookies = csrfRes.headers.getSetCookie().map(c => String(c).split(';')[0]).join('; ');
+  // Login
+  if (SILLYTAVERN_USERNAME && SILLYTAVERN_PASSWORD) {
+    const loginRes = await fetch(`${SILLYTAVERN_BASE_URL}/api/users/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': stCsrfToken, Cookie: initCookies },
+      body: JSON.stringify({ handle: SILLYTAVERN_USERNAME, password: SILLYTAVERN_PASSWORD })
+    });
+    if (!loginRes.ok) throw new Error(`ST login failed: ${loginRes.status}`);
+    stSessionCookie = loginRes.headers.getSetCookie().map(c => String(c).split(';')[0]).join('; ');
+    // Refresh CSRF after login
+    const csrf2Res = await fetch(`${SILLYTAVERN_BASE_URL}/csrf-token`, { headers: { Cookie: stSessionCookie } });
+    if (csrf2Res.ok) stCsrfToken = (await csrf2Res.json()).token || stCsrfToken;
+  } else {
+    stSessionCookie = initCookies;
+  }
 }
 
 function isHttpUrl(value) {
@@ -135,16 +164,27 @@ function applyCharacterOverride(character, override) {
 }
 
 async function stRequest(pathOrUrl, options = {}) {
+  await ensureStSession();
   const isAbsolute = isHttpUrl(pathOrUrl);
   const url = isAbsolute ? String(pathOrUrl) : `${SILLYTAVERN_BASE_URL}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
   const headers = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
-    'x-api-key': SILLYTAVERN_API_KEY,
-    Authorization: `Bearer ${SILLYTAVERN_API_KEY}`,
+    ...(SILLYTAVERN_API_KEY ? { 'x-api-key': SILLYTAVERN_API_KEY, Authorization: `Bearer ${SILLYTAVERN_API_KEY}` } : {}),
+    ...(stSessionCookie ? { Cookie: stSessionCookie } : {}),
+    ...(stCsrfToken ? { 'X-CSRF-Token': stCsrfToken } : {}),
     ...(options.headers || {})
   };
-  return fetch(url, { ...options, headers });
+  const res = await fetch(url, { ...options, headers });
+  // If 403, session may have expired — clear and retry once
+  if (res.status === 403 && stSessionCookie) {
+    stSessionCookie = '';
+    stCsrfToken = '';
+    await ensureStSession();
+    const retryHeaders = { ...headers, Cookie: stSessionCookie, 'X-CSRF-Token': stCsrfToken };
+    return fetch(url, { ...options, headers: retryHeaders });
+  }
+  return res;
 }
 
 function pickArrayPayload(payload) {
@@ -160,29 +200,30 @@ function pickArrayPayload(payload) {
 async function fetchSillyCharacters() {
   const explicit = SILLYTAVERN_CHARACTERS_URL || '';
   const probes = explicit
-    ? [explicit]
+    ? [{ path: explicit, method: 'GET' }]
     : [
-        '/api/characters',
-        '/api/characters/list',
-        '/api/v1/characters',
-        '/api/char/list',
-        '/characters'
+        { path: '/api/characters/all', method: 'POST' },
+        { path: '/api/characters', method: 'GET' },
+        { path: '/api/characters/list', method: 'GET' },
+        { path: '/api/v1/characters', method: 'GET' },
+        { path: '/api/char/list', method: 'GET' },
+        { path: '/characters', method: 'GET' }
       ];
 
   const errors = [];
   for (const probe of probes) {
     try {
-      const res = await stRequest(probe, { method: 'GET' });
+      const res = await stRequest(probe.path, { method: probe.method });
       if (!res.ok) {
-        errors.push(`${probe}: ${res.status}`);
+        errors.push(`${probe.path}: ${res.status}`);
         continue;
       }
       const data = await res.json().catch(() => null);
       const rows = pickArrayPayload(data);
       if (rows.length > 0) return rows;
-      errors.push(`${probe}: empty`);
+      errors.push(`${probe.path}: empty`);
     } catch (err) {
-      errors.push(`${probe}: ${err.message || String(err)}`);
+      errors.push(`${probe.path}: ${err.message || String(err)}`);
     }
   }
   throw new Error(`Could not fetch SillyTavern characters (${errors.join(' | ')})`);
