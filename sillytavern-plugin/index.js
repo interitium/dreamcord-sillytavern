@@ -3,6 +3,7 @@ const path = require('node:path');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const MAP_PATH = path.join(DATA_DIR, 'character-map.json');
+const OVERRIDES_PATH = path.join(DATA_DIR, 'character-overrides.json');
 
 const DREAMCORD_BASE_URL = String(process.env.DREAMCORD_BASE_URL || '').replace(/\/$/, '');
 const DREAMCORD_BOT_TOKEN = String(process.env.DREAMCORD_BOT_TOKEN || '');
@@ -64,6 +65,49 @@ async function loadCharacterMap() {
 async function saveCharacterMap(map) {
   await ensureDataDir();
   await fs.writeFile(MAP_PATH, JSON.stringify(map || {}, null, 2), 'utf8');
+}
+
+async function loadCharacterOverrides() {
+  await ensureDataDir();
+  try {
+    const raw = await fs.readFile(OVERRIDES_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function saveCharacterOverrides(overrides) {
+  await ensureDataDir();
+  await fs.writeFile(OVERRIDES_PATH, JSON.stringify(overrides || {}, null, 2), 'utf8');
+}
+
+function sanitizeCharacterOverride(input) {
+  const next = {};
+  const src = input && typeof input === 'object' ? input : {};
+  if (src.name !== undefined) next.name = String(src.name || '').trim().slice(0, 80);
+  if (src.description !== undefined) next.description = String(src.description || '').trim().slice(0, 2000);
+  if (src.bio !== undefined) next.bio = String(src.bio || '').trim().slice(0, 4000);
+  if (src.status_text !== undefined) next.status_text = String(src.status_text || '').trim().slice(0, 120);
+  if (src.avatar_url !== undefined) next.avatar_url = isHttpUrl(src.avatar_url) ? String(src.avatar_url).trim() : '';
+  if (src.banner_url !== undefined) next.banner_url = isHttpUrl(src.banner_url) ? String(src.banner_url).trim() : '';
+  if (src.room_id !== undefined) next.room_id = String(src.room_id || '').trim().slice(0, 120);
+  return next;
+}
+
+function applyCharacterOverride(character, override) {
+  if (!override || typeof override !== 'object') return character;
+  return {
+    ...character,
+    name: override.name !== undefined && override.name !== '' ? String(override.name).trim().slice(0, 80) : character.name,
+    description: override.description !== undefined ? String(override.description || '').trim().slice(0, 2000) : character.description,
+    bio: override.bio !== undefined ? String(override.bio || '').trim().slice(0, 4000) : character.bio,
+    status_text: override.status_text !== undefined ? String(override.status_text || '').trim().slice(0, 120) : character.status_text,
+    avatar_url: override.avatar_url !== undefined ? (isHttpUrl(override.avatar_url) ? String(override.avatar_url).trim() : '') : character.avatar_url,
+    banner_url: override.banner_url !== undefined ? (isHttpUrl(override.banner_url) ? String(override.banner_url).trim() : '') : character.banner_url,
+    room_id: override.room_id !== undefined ? String(override.room_id || '').trim().slice(0, 120) : character.room_id
+  };
 }
 
 async function stRequest(pathOrUrl, options = {}) {
@@ -262,7 +306,11 @@ async function runCharacterSync(opts = {}) {
   const targetChannelId = String(opts.targetChannelId || DEFAULT_TARGET_CHANNEL_ID || '').trim();
 
   const rawCharacters = await fetchSillyCharacters();
-  const normalized = rawCharacters.map(normalizeCharacter).filter(Boolean);
+  const overrides = await loadCharacterOverrides();
+  const normalized = rawCharacters
+    .map(normalizeCharacter)
+    .filter(Boolean)
+    .map((c) => applyCharacterOverride(c, overrides[String(c.source_id)]));
   const dedup = new Map();
   normalized.forEach((c) => { if (!dedup.has(c.source_id)) dedup.set(c.source_id, c); });
   const sourceChars = Array.from(dedup.values());
@@ -399,6 +447,79 @@ async function init(router) {
       res.json({ ok: true, mappings: map });
     } catch (err) {
       res.status(500).json({ error: err.message || 'Could not read mappings' });
+    }
+  });
+
+  router.get('/characters/preview', async (_req, res) => {
+    try {
+      if (!hasBridgeConfig()) {
+        return res.status(400).json({ error: 'Bridge not configured. Fill env vars first.' });
+      }
+      const [rawCharacters, map, overrides, apps] = await Promise.all([
+        fetchSillyCharacters(),
+        loadCharacterMap(),
+        loadCharacterOverrides(),
+        dcAdminJson('/admin/dev-portal/apps')
+      ]);
+      const appList = Array.isArray(apps) ? apps : [];
+      const byId = new Map(appList.map((a) => [String(a.id), a]));
+      const byName = new Map(appList.map((a) => [String(a.name || '').toLowerCase(), a]));
+      const rows = rawCharacters
+        .map(normalizeCharacter)
+        .filter(Boolean)
+        .map((c) => {
+          const sourceId = String(c.source_id);
+          const override = overrides[sourceId] || null;
+          const merged = applyCharacterOverride(c, override);
+          const mappedId = String(map[sourceId] || '').trim();
+          const app = mappedId ? byId.get(mappedId) : (byName.get(String(merged.name || '').toLowerCase()) || null);
+          return {
+            source_id: sourceId,
+            character: merged,
+            override,
+            mapped_app_id: app?.id || mappedId || null,
+            mapped_app_name: app?.name || null,
+            mapped_active: app?.is_active === true
+          };
+        });
+      res.json({ ok: true, total: rows.length, rows });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || 'Could not build preview' });
+    }
+  });
+
+  router.put('/characters/:sourceId/override', async (req, res) => {
+    try {
+      const sourceId = String(req.params.sourceId || '').trim();
+      if (!sourceId) return res.status(400).json({ error: 'sourceId is required' });
+      const patch = sanitizeCharacterOverride(req.body || {});
+      const overrides = await loadCharacterOverrides();
+      const next = { ...(overrides[sourceId] || {}), ...patch };
+      const compact = Object.fromEntries(
+        Object.entries(next).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
+      );
+      if (Object.keys(compact).length === 0) {
+        delete overrides[sourceId];
+      } else {
+        overrides[sourceId] = compact;
+      }
+      await saveCharacterOverrides(overrides);
+      res.json({ ok: true, source_id: sourceId, override: overrides[sourceId] || null });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || 'Could not save override' });
+    }
+  });
+
+  router.delete('/characters/:sourceId/override', async (req, res) => {
+    try {
+      const sourceId = String(req.params.sourceId || '').trim();
+      if (!sourceId) return res.status(400).json({ error: 'sourceId is required' });
+      const overrides = await loadCharacterOverrides();
+      delete overrides[sourceId];
+      await saveCharacterOverrides(overrides);
+      res.json({ ok: true, source_id: sourceId });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message || 'Could not clear override' });
     }
   });
 
