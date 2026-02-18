@@ -26,6 +26,7 @@ const SILLYTAVERN_PASSWORD = String(process.env.SILLYTAVERN_PASSWORD || '');
 const SILLYTAVERN_CHARACTERS_URL = String(process.env.SILLYTAVERN_CHARACTERS_URL || '').trim();
 const DEFAULT_TARGET_CHANNEL_ID = String(process.env.DEFAULT_TARGET_CHANNEL_ID || '').trim();
 const DEFAULT_SOURCE_LABEL = String(process.env.DEFAULT_SOURCE_TAG || 'sillytavern').trim().slice(0, 40) || 'sillytavern';
+const LOCAL_LLM_URL = String(process.env.LOCAL_LLM_URL || '').replace(/\/$/, '').trim();
 
 let adminSessionCookie = '';
 let stSessionCookie = '';
@@ -413,6 +414,30 @@ function isBadModelReply(text) {
   );
 }
 
+async function localLlmChat(system, userPrompt) {
+  if (!LOCAL_LLM_URL) return null;
+  try {
+    const res = await fetch(`${LOCAL_LLM_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        model: 'default',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.9,
+        max_tokens: 200
+      })
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => ({}));
+    const text = extractChatReply(data);
+    if (text && !isBadModelReply(text)) return text;
+  } catch (_) {}
+  return null;
+}
+
 async function sillyTavernChatForCharacter(character, input) {
   const charName = String(character?.name || 'Character').trim();
   const desc = String(character?.description || '').trim();
@@ -421,7 +446,26 @@ async function sillyTavernChatForCharacter(character, input) {
   const contextBits = [desc, bio].filter(Boolean).join('\n\n');
   const userPrompt = contextBits ? `${contextBits}\n\nUser message: ${String(input || '').trim()}` : String(input || '').trim();
 
+  // Try local LLM first (fastest, no auth needed)
+  const localReply = await localLlmChat(system, userPrompt);
+  if (localReply) return localReply;
+
+  // Fall back to ST generation proxy
   const probes = [
+    {
+      path: '/api/backends/chat-completions/generate',
+      body: {
+        chat_completion_source: 'custom',
+        custom_url: LOCAL_LLM_URL || undefined,
+        model: 'default',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.9,
+        max_tokens: 200
+      }
+    },
     {
       path: '/api/backends/chat-completions/generate',
       body: {
@@ -431,27 +475,7 @@ async function sillyTavernChatForCharacter(character, input) {
           { role: 'user', content: userPrompt }
         ],
         temperature: 0.9,
-        max_tokens: 180
-      }
-    },
-    {
-      path: '/api/backends/text-completions/generate',
-      body: {
-        prompt: `${system}\n\n${userPrompt}`,
-        temperature: 0.9,
-        max_tokens: 180
-      }
-    },
-    {
-      path: '/v1/chat/completions',
-      body: {
-        model: 'default',
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.9,
-        max_tokens: 180
+        max_tokens: 200
       }
     }
   ];
@@ -473,7 +497,7 @@ async function sillyTavernChatForCharacter(character, input) {
       errors.push(`${p.path}:${String(e?.message || e)}`);
     }
   }
-  throw new Error(`SillyTavern generation failed (${errors.join(' | ')})`);
+  throw new Error(`Generation failed (${errors.join(' | ')})`);
 }
 
 function shouldCharacterRespond(content, botName, sourceId, triggerKeyword) {
