@@ -20,8 +20,25 @@
     return node;
   }
 
+  function getStHeaders() {
+    try {
+      if (typeof window.getRequestHeaders === 'function') {
+        return window.getRequestHeaders() || {};
+      }
+    } catch (_) {}
+    const headers = {};
+    const meta = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+    if (meta) headers['X-CSRF-Token'] = meta;
+    return headers;
+  }
+
   async function jget(path) {
-    const res = await fetch(`${API}${path}`, { credentials: 'include' });
+    const res = await fetch(`${API}${path}`, {
+      credentials: 'include',
+      headers: {
+        ...getStHeaders()
+      }
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
     return data;
@@ -31,7 +48,10 @@
     const res = await fetch(`${API}${path}`, {
       method,
       credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...getStHeaders()
+      },
       body: body ? JSON.stringify(body) : undefined
     });
     const data = await res.json().catch(() => ({}));
