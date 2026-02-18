@@ -1,0 +1,71 @@
+Dreamcord SillyTavern Bridge - Handoff Notes for Claude
+Date: 2026-02-18
+Repo: dreamcord-sillytavern
+
+Goal
+- SillyTavern extension + server plugin that syncs characters into Dreamcord bot apps.
+- Extension UI should be accordion/collapsible per character with manual overrides.
+- Overrides should include:
+  - name, description, bio, status_text
+  - avatar_url, banner_url
+  - room_id
+  - api_key (per character)
+  - bot_token (per character)
+
+Current Frontend Status
+- Extension frontend script loads successfully.
+- Console confirms: [dreamcord-sillytavern-bridge] settings panel mounted
+- Accordion UI is implemented in extension index.js.
+- API calls from frontend now include ST auth/CSRF headers.
+
+Critical Current Error
+- API route still returns 404:
+  GET /api/plugins/dreamcord-sillytavern-bridge/health -> 404
+  GET /api/plugins/dreamcord-sillytavern-bridge/characters/preview -> 404
+- This indicates server-side plugin is not being loaded/registered by SillyTavern.
+
+Observed Runtime Issues
+- User also hit occasional "Invalid CSRF token" after container restart.
+  - Usually fixed by hard refresh + re-login.
+- Frontend extension path issues previously seen with unrelated third-party extensions (404/MIME errors), but those are separate.
+
+What Was Already Tried
+- Copied plugin index.js to multiple possible container paths:
+  - /home/node/app/plugins/dreamcord-sillytavern-bridge/index.js
+  - /home/node/app/data/plugins/dreamcord-sillytavern-bridge/index.js
+  - /home/node/app/data/default-user/plugins/dreamcord-sillytavern-bridge/index.js
+- Restarted container.
+- Still no health route; still 404.
+
+Likely Root Cause
+- This SillyTavern Docker image likely expects server plugins from a different location,
+  or requires a specific plugin manifest/bootstrap format beyond plain index.js placement.
+
+What Claude Should Verify First
+1) Confirm exact server-plugin discovery path in this specific ST image/version.
+2) Confirm required plugin file layout (manifest/package entrypoint, export shape).
+3) Confirm plugin loader logs on startup and whether this plugin name is scanned.
+4) Confirm reverse proxy does not strip /api/plugins/* (but 404 page is ST app-style, so likely not nginx).
+
+Expected End State
+- /api/plugins/dreamcord-sillytavern-bridge/health returns 200 JSON.
+- /api/plugins/dreamcord-sillytavern-bridge/characters/preview returns character rows.
+- Extension settings shows accordion entries for characters.
+- Save override / clear override works and persists.
+- Sync now and dry sync work without 403/404.
+
+Files Touched Recently
+- index.js (extension frontend UI)
+- sillytavern-plugin/index.js (backend plugin API and sync logic)
+- Added override fields: api_key, bot_token
+
+Recent commits in this repo
+- 17e1982 fix: include SillyTavern auth headers for plugin API requests
+- 2e95078 feat: collapsible character settings with per-character api key and bot token
+- 144833f feat: extension settings UI for per-character overrides + preview APIs
+- 6ad4f84 fix: add SillyTavern root manifest for URL extension install
+
+Direct Ask for Claude
+- Make the backend plugin actually load in this dockerized ST deployment.
+- Keep existing frontend accordion and override model.
+- If plugin loader format/path differs, adapt repo structure accordingly and document exact deploy steps.
