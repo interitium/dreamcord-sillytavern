@@ -5,6 +5,7 @@
 
   let API = ST_PLUGIN_API;
   let rows = [];
+  let searchTerm = '';
   let apiResolved = false;
 
   function el(tag, attrs = {}, children = []) {
@@ -94,13 +95,30 @@
     const host = document.getElementById('dcst-rows');
     if (!host) return;
     host.innerHTML = '';
+    const q = String(searchTerm || '').trim().toLowerCase();
+    const visibleRows = !q
+      ? rows
+      : rows.filter((row) => {
+          const c = row.character || {};
+          const haystack = [
+            row.source_id,
+            c.name,
+            c.description,
+            c.status_text,
+            row.mapped_app_name
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+          return haystack.includes(q);
+        });
 
-    if (!rows.length) {
+    if (!visibleRows.length) {
       host.appendChild(el('div', { class: 'dcst-empty', text: 'No characters found.' }));
       return;
     }
 
-    rows.forEach((row, idx) => {
+    visibleRows.forEach((row, idx) => {
       const sourceId = String(row.source_id || '');
       const c = row.character || {};
       const details = el('details', { class: 'dcst-item' });
@@ -248,6 +266,7 @@
       #dcst-panel { border:1px solid #3a4356; border-radius:10px; padding:10px; margin-top:10px; background:#151a24; }
       #dcst-panel h3 { margin:0 0 8px; font-size:14px; color:#dce6ff; }
       .dcst-top { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+      .dcst-top input { min-width:260px; border:1px solid #43506a; background:#101521; color:#e2eaff; border-radius:7px; padding:6px 10px; }
       .dcst-top button { border:1px solid #43506a; background:#222c3f; color:#e2eaff; border-radius:7px; padding:6px 10px; cursor:pointer; }
       #dcst-rows { display:grid; gap:8px; }
       .dcst-item { border:1px solid #33405a; border-radius:9px; background:#121826; overflow:hidden; }
@@ -272,6 +291,7 @@
     const panel = el('div', { id: 'dcst-panel' }, [
       el('h3', { text: 'Dreamcord SillyTavern Bridge' }),
       el('div', { class: 'dcst-top' }, [
+        el('input', { id: 'dcst-search', type: 'text', placeholder: 'Search characters...' }),
         el('button', { id: 'dcst-refresh', type: 'button', text: 'Refresh preview' }),
         el('button', { id: 'dcst-sync-dry', type: 'button', text: 'Dry sync' }),
         el('button', { id: 'dcst-sync', type: 'button', text: 'Sync now' })
@@ -287,6 +307,13 @@
     document.getElementById('dcst-refresh').onclick = () => loadPreview();
     document.getElementById('dcst-sync-dry').onclick = () => syncNow(true);
     document.getElementById('dcst-sync').onclick = () => syncNow(false);
+    const searchInput = document.getElementById('dcst-search');
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        searchTerm = String(searchInput.value || '');
+        renderRows();
+      });
+    }
 
     loadPreview();
   }
