@@ -31,6 +31,9 @@ let adminSessionCookie = '';
 let stSessionCookie = '';
 let stCsrfToken = '';
 const presenceBySource = new Map();
+const responderBySource = new Map();
+let responderLoop = null;
+let responderLoopBusy = false;
 
 function hasBridgeConfig() {
   return !!(DREAMCORD_BASE_URL && SILLYTAVERN_BASE_URL && DREAMCORD_ADMIN_USERNAME && DREAMCORD_ADMIN_PASSWORD);
@@ -74,6 +77,12 @@ function getPresenceState(sourceId) {
     desired: Boolean(entry.desired),
     last_error: String(entry.last_error || '')
   };
+}
+
+function getResponderState(sourceId) {
+  const entry = responderBySource.get(String(sourceId));
+  if (!entry) return { enabled: false, busy: false, last_error: '' };
+  return { enabled: Boolean(entry.enabled), busy: Boolean(entry.busy), last_error: String(entry.last_error || '') };
 }
 
 function disconnectPresenceForSource(sourceId) {
@@ -290,6 +299,7 @@ function sanitizeCharacterOverride(input) {
   if (src.api_key !== undefined) next.api_key = String(src.api_key || '').trim().slice(0, 512);
   if (src.bot_token !== undefined) next.bot_token = String(src.bot_token || '').trim().slice(0, 512);
   if (src.presence_enabled !== undefined) next.presence_enabled = Boolean(src.presence_enabled);
+  if (src.responder_enabled !== undefined) next.responder_enabled = Boolean(src.responder_enabled);
   return next;
 }
 
@@ -307,6 +317,153 @@ function applyCharacterOverride(character, override) {
     api_key: override.api_key !== undefined ? String(override.api_key || '').trim().slice(0, 512) : (character.api_key || ''),
     bot_token: override.bot_token !== undefined ? String(override.bot_token || '').trim().slice(0, 512) : (character.bot_token || '')
   };
+}
+
+async function dcBotJson(pathname, token, options = {}) {
+  const tk = String(token || '').trim();
+  if (!tk) throw new Error('bot token missing');
+  const headers = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    Authorization: `Bot ${tk}`,
+    ...(options.headers || {})
+  };
+  const res = await fetch(`${DREAMCORD_BASE_URL}${pathname}`, { ...options, headers });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Dreamcord bot ${options.method || 'GET'} ${pathname} failed: ${res.status} ${txt}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+function extractNomiReply(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  const candidates = [
+    payload.reply,
+    payload.response,
+    payload.message,
+    payload.text,
+    payload?.data?.reply,
+    payload?.data?.text,
+    payload?.assistantMessage?.text,
+    payload?.replyMessage?.text,
+    payload?.reply_message?.text,
+    payload?.assistant_message?.text,
+    payload?.message?.text
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return '';
+}
+
+async function nomiChatForCharacter(apiKey, nomiId, input) {
+  const key = String(apiKey || '').trim();
+  const id = String(nomiId || '').trim();
+  if (!key) throw new Error('Missing character api_key');
+  if (!id) throw new Error('Missing character room_id (used as Nomi id)');
+
+  const res = await fetch(`https://api.nomi.ai/v1/nomis/${encodeURIComponent(id)}/chat`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ messageText: String(input || '') })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Nomi API failed: ${res.status} ${txt}`);
+  }
+  const payload = await res.json().catch(() => ({}));
+  const text = extractNomiReply(payload);
+  if (!text) throw new Error('Nomi API returned no reply text');
+  return text;
+}
+
+function shouldCharacterRespond(content, botName) {
+  const raw = String(content || '').trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  const name = String(botName || '').trim().toLowerCase();
+  if (name && lower.includes(`@${name}`)) return true;
+  return false;
+}
+
+async function runResponderTick() {
+  if (responderLoopBusy) return;
+  responderLoopBusy = true;
+  try {
+    const overrides = await loadCharacterOverrides();
+    const entries = Object.entries(overrides || {}).filter(([, ov]) =>
+      ov && ov.responder_enabled === true && ov.bot_token && ov.api_key && ov.room_id
+    );
+    for (const [sourceId, ov] of entries) {
+      const state = responderBySource.get(sourceId) || {
+        enabled: true,
+        busy: false,
+        last_error: '',
+        botName: '',
+        botId: '',
+        lastSeenByChannel: {}
+      };
+      state.enabled = true;
+      if (state.busy) {
+        responderBySource.set(sourceId, state);
+        continue;
+      }
+      state.busy = true;
+      responderBySource.set(sourceId, state);
+      try {
+        if (!state.botName || !state.botId) {
+          const me = await dcBotJson('/bot/me', ov.bot_token, { method: 'GET' });
+          state.botName = String(me?.name || '').trim();
+          state.botId = String(me?.id || '').trim();
+        }
+
+        const channels = await dcBotJson('/bot/channels', ov.bot_token, { method: 'GET' });
+        const textChannels = (Array.isArray(channels) ? channels : []).filter((c) => c.channel_type === 'text' || c.channel_type === 'forum');
+        for (const ch of textChannels) {
+          const chId = String(ch.id || '');
+          if (!chId) continue;
+          const prev = String(state.lastSeenByChannel[chId] || '');
+          if (!prev) {
+            state.lastSeenByChannel[chId] = new Date().toISOString();
+            continue;
+          }
+          const messages = await dcBotJson(`/bot/channels/${encodeURIComponent(chId)}/messages?after=${encodeURIComponent(prev)}&limit=40`, ov.bot_token, { method: 'GET' });
+          const list = Array.isArray(messages) ? messages : [];
+          for (const m of list) {
+            const mId = String(m?.id || '');
+            if (!mId) continue;
+            const createdAt = String(m?.created_at || '');
+            if (createdAt && createdAt > String(state.lastSeenByChannel[chId] || '')) {
+              state.lastSeenByChannel[chId] = createdAt;
+            }
+            if (String(m?.author_id || '') === String(state.botId || '')) continue;
+            if (String(m?.author_id || '').startsWith('bot:') && String(m?.author_id || '') === String(state.botId || '')) continue;
+            const content = String(m?.content || '');
+            if (!shouldCharacterRespond(content, state.botName)) continue;
+            const prompt = content.replace(new RegExp(`@${String(state.botName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'ig'), '').trim() || content;
+            const reply = await nomiChatForCharacter(ov.api_key, ov.room_id, prompt);
+            await dcBotJson(`/bot/channels/${encodeURIComponent(chId)}/messages`, ov.bot_token, {
+              method: 'POST',
+              body: JSON.stringify({ content: reply, prefix: false })
+            });
+          }
+        }
+        state.last_error = '';
+      } catch (e) {
+        state.last_error = String(e?.message || e || 'responder error');
+      } finally {
+        state.busy = false;
+        responderBySource.set(sourceId, state);
+      }
+    }
+  } finally {
+    responderLoopBusy = false;
+  }
 }
 
 async function stRequest(pathOrUrl, options = {}) {
@@ -702,7 +859,8 @@ async function init(router) {
             mapped_app_id: app?.id || mappedId || null,
             mapped_app_name: app?.name || null,
             mapped_active: app?.is_active === true,
-            presence: getPresenceState(sourceId)
+            presence: getPresenceState(sourceId),
+            responder: getResponderState(sourceId)
           };
         });
       res.json({ ok: true, total: rows.length, rows });
@@ -740,7 +898,10 @@ async function init(router) {
       } else if (saved?.presence_enabled !== true) {
         disconnectPresenceForSource(sourceId);
       }
-      res.json({ ok: true, source_id: sourceId, override: saved, presence: getPresenceState(sourceId) });
+      const respState = responderBySource.get(sourceId) || { enabled: false, busy: false, last_error: '' };
+      respState.enabled = Boolean(saved?.responder_enabled === true);
+      responderBySource.set(sourceId, respState);
+      res.json({ ok: true, source_id: sourceId, override: saved, presence: getPresenceState(sourceId), responder: getResponderState(sourceId) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || 'Could not save override' });
     }
@@ -754,6 +915,7 @@ async function init(router) {
       delete overrides[sourceId];
       await saveCharacterOverrides(overrides);
       disconnectPresenceForSource(sourceId);
+      responderBySource.delete(sourceId);
       res.json({ ok: true, source_id: sourceId });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message || 'Could not clear override' });
@@ -762,6 +924,11 @@ async function init(router) {
 
   router.get('/presence/status', (_req, res) => {
     const rows = Array.from(presenceBySource.entries()).map(([source_id]) => ({ source_id, ...getPresenceState(source_id) }));
+    res.json({ ok: true, rows });
+  });
+
+  router.get('/responder/status', (_req, res) => {
+    const rows = Array.from(responderBySource.entries()).map(([source_id]) => ({ source_id, ...getResponderState(source_id) }));
     res.json({ ok: true, rows });
   });
 
@@ -830,10 +997,20 @@ async function init(router) {
       });
     })
     .catch(() => {});
+
+  if (!responderLoop) {
+    responderLoop = setInterval(() => {
+      runResponderTick().catch(() => {});
+    }, 4000);
+  }
 }
 
 async function exit() {
   Array.from(presenceBySource.keys()).forEach((sourceId) => disconnectPresenceForSource(sourceId));
+  if (responderLoop) {
+    clearInterval(responderLoop);
+    responderLoop = null;
+  }
   console.log('[dreamcord-sillytavern-bridge] plugin unloaded');
 }
 

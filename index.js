@@ -87,7 +87,8 @@
       room_id: get('dcst-room-id'),
       api_key: get('dcst-api-key'),
       bot_token: get('dcst-bot-token'),
-      presence_enabled: getBool('dcst-presence-enabled')
+      presence_enabled: getBool('dcst-presence-enabled'),
+      responder_enabled: getBool('dcst-responder-enabled')
     };
   }
 
@@ -134,6 +135,10 @@
           el('span', {
             class: `dcst-pill ${(row.presence?.connected ? 'ok' : 'warn')}`,
             text: `Presence: ${row.presence?.status || 'offline'}`
+          }),
+          el('span', {
+            class: `dcst-pill ${(row.responder?.enabled ? 'ok' : 'warn')}`,
+            text: `Responder: ${row.responder?.enabled ? 'on' : 'off'}`
           })
         ])
       ]);
@@ -167,10 +172,15 @@
         el('input', { id: `dcst-bot-token-${sourceId}`, value: c.bot_token || '', placeholder: 'dcb_...' }),
 
         el('label', { text: 'Bot presence enabled' }),
-        el('input', { id: `dcst-presence-enabled-${sourceId}`, type: 'checkbox' })
+        el('input', { id: `dcst-presence-enabled-${sourceId}`, type: 'checkbox' }),
+
+        el('label', { text: 'Auto respond enabled' }),
+        el('input', { id: `dcst-responder-enabled-${sourceId}`, type: 'checkbox' })
       ]);
       const enabledCb = fields.querySelector(`#dcst-presence-enabled-${sourceId}`);
       if (enabledCb) enabledCb.checked = Boolean(row.override?.presence_enabled === true);
+      const responderCb = fields.querySelector(`#dcst-responder-enabled-${sourceId}`);
+      if (responderCb) responderCb.checked = Boolean(row.override?.responder_enabled === true);
 
       const actions = el('div', { class: 'dcst-actions' }, [
         el('button', { type: 'button', text: 'Connect bot' }),
