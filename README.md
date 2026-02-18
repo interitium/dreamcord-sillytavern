@@ -1,74 +1,65 @@
-# Dreamcord SillyTavern Bridge (v0.1.0)
+# Dreamcord SillyTavern Bridge (v0.2.0)
 
-This project supports two install modes:
+Syncs SillyTavern characters into Dreamcord Dev Portal bot apps with per-character overrides (name, description, bio, status, avatar, banner, room, API key, bot token).
 
-1. Standalone local service (`src/index.js`)
-2. SillyTavern server plugin extension (`sillytavern-plugin/`) for GitHub/local install
+## Install modes
 
-## What is included now
+### 1. Standalone bridge server (recommended)
 
-- Node + Express service scaffold
-- Health/config endpoints
-- Real `POST /sync/characters` flow:
-  - fetch SillyTavern characters
-  - normalize character payloads
-  - create/update Dreamcord Dev Portal bot apps
-  - optional disable of missing source characters
-  - local source-id to app-id mapping persistence
-- Dreamcord bot-post helper for sync summary notifications
-- Env-driven configuration
+Runs as its own Express service on port 3710. The SillyTavern frontend extension auto-detects it — no ST server plugin loading needed.
 
-## Folder
+### 2. SillyTavern server plugin
 
-`d:\webview\Dreamuniverse\dreamcord-sillytavern-bridge`
+If your ST instance has `enableServerPlugins: true` in `config.yaml`, you can install `sillytavern-plugin/` into `<ST>/plugins/dreamcord-sillytavern-bridge/`. See `sillytavern-plugin/README.md`.
 
-Plugin extension folder:
+### 3. Frontend extension only
 
-`d:\webview\Dreamuniverse\dreamcord-sillytavern-bridge\sillytavern-plugin`
+The root `manifest.json` + `index.js` can be installed as an ST URL extension. The extension UI auto-probes for the backend (ST plugin path first, then standalone on ports 3710/3711).
 
 ## Quick start (standalone)
-
-1. Copy env template:
 
 ```powershell
 cd d:\webview\Dreamuniverse\dreamcord-sillytavern-bridge
 copy .env.example .env
-```
-
-2. Fill required values in `.env`:
-
-- `DREAMCORD_BASE_URL`
-- `DREAMCORD_ADMIN_USERNAME`
-- `DREAMCORD_ADMIN_PASSWORD`
-- `DREAMCORD_ADMIN_2FA` (optional, required only if admin uses 2FA)
-- `SILLYTAVERN_BASE_URL`
-- `SILLYTAVERN_API_KEY`
-- `DREAMCORD_BOT_TOKEN` (optional, only for posting sync summary into channel)
-
-3. Install and run:
-
-```powershell
+# Fill .env with your credentials
 npm install
 npm run dev
 ```
 
-4. Test health:
+Test: `curl http://127.0.0.1:3710/health`
 
-```powershell
-curl http://127.0.0.1:3710/health
-```
+## Required env vars
 
-## Endpoints
+| Variable | Required | Description |
+|---|---|---|
+| `DREAMCORD_BASE_URL` | Yes | e.g. `https://dreamcord.interitium.dk/api` |
+| `DREAMCORD_ADMIN_USERNAME` | Yes | Admin account for Dev Portal API |
+| `DREAMCORD_ADMIN_PASSWORD` | Yes | Admin password |
+| `SILLYTAVERN_BASE_URL` | Yes | e.g. `http://127.0.0.1:8000` |
+| `SILLYTAVERN_API_KEY` | Yes | ST API key |
+| `DREAMCORD_ADMIN_2FA` | If 2FA | TOTP code (or static secret) |
+| `DREAMCORD_BOT_TOKEN` | No | For posting sync summaries to a channel |
+| `DEFAULT_TARGET_CHANNEL_ID` | No | Channel to post sync summaries |
+| `DEFAULT_SOURCE_TAG` | No | Label for imported apps (default: `sillytavern`) |
+| `SILLYTAVERN_CHARACTERS_URL` | No | Override ST character endpoint |
 
-- `GET /health`
-- `GET /config`
-- `GET /mappings`
-- `POST /sync/characters?dry_run=1`
+## API endpoints
 
-Body example:
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Health check |
+| GET | `/config` | Current bridge config (no secrets) |
+| GET | `/mappings` | Source-to-app ID map |
+| GET | `/characters/preview` | Fetch ST characters + Dreamcord app mapping + overrides |
+| PUT | `/characters/:sourceId/override` | Save per-character override fields |
+| DELETE | `/characters/:sourceId/override` | Clear override for a character |
+| POST | `/sync/characters` | Run full sync (create/update/disable apps) |
+
+### Sync body example
 
 ```json
 {
+  "dry_run": false,
   "target_channel_id": "<optional dreamcord channel uuid>",
   "create_missing": true,
   "update_existing": true,
@@ -76,24 +67,27 @@ Body example:
 }
 ```
 
-## Plugin extension install
+## Per-character overrides
 
-See:
+Each character supports these override fields (set via the extension UI or API):
+- `name`, `description`, `bio`, `status_text`
+- `avatar_url`, `banner_url`
+- `room_id` — Nomi room routing
+- `api_key` — per-character Nomi/external API key
+- `bot_token` — per-character Dreamcord bot token
 
-`./sillytavern-plugin/README.md`
+Override data persists in `data/character-overrides.json`.
 
-## Notes
+## Data files
 
-- Mapping file path:
-  - `data/character-map.json`
-- Current SillyTavern fetch probes (when `SILLYTAVERN_CHARACTERS_URL` is not set):
-  - `/api/characters`
-  - `/api/characters/list`
-  - `/api/v1/characters`
-  - `/api/char/list`
-  - `/characters`
+- `data/character-map.json` — source ID to Dreamcord app ID mapping
+- `data/character-overrides.json` — per-character field overrides
 
+## SillyTavern character fetch probes
 
-## URL extension install (manifest)
-This repo now contains root \\manifest.json\\ and \\index.js\\ so SillyTavern URL install succeeds.
-For sync APIs, also install \\sillytavern-plugin/\\ into SillyTavern server plugins.
+When `SILLYTAVERN_CHARACTERS_URL` is not set, the bridge probes these endpoints in order:
+- `/api/characters`
+- `/api/characters/list`
+- `/api/v1/characters`
+- `/api/char/list`
+- `/characters`

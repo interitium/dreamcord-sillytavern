@@ -7,10 +7,21 @@ import { fileURLToPath } from 'node:url';
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
+// CORS — allow SillyTavern frontend (any origin) to call this standalone server
+app.use((_req, res, next) => {
+  res.header('Access-Control-Allow-Origin', _req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-CSRF-Token,x-api-key');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  if (_req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const MAP_PATH = path.join(DATA_DIR, 'character-map.json');
+const OVERRIDES_PATH = path.join(DATA_DIR, 'character-overrides.json');
 
 const PORT = Number(process.env.PORT || 3710);
 const DREAMCORD_BASE_URL = String(process.env.DREAMCORD_BASE_URL || '').replace(/\/$/, '');
@@ -74,6 +85,53 @@ async function loadCharacterMap() {
 async function saveCharacterMap(map) {
   await ensureDataDir();
   await fs.writeFile(MAP_PATH, JSON.stringify(map || {}, null, 2), 'utf8');
+}
+
+async function loadCharacterOverrides() {
+  await ensureDataDir();
+  try {
+    const raw = await fs.readFile(OVERRIDES_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function saveCharacterOverrides(overrides) {
+  await ensureDataDir();
+  await fs.writeFile(OVERRIDES_PATH, JSON.stringify(overrides || {}, null, 2), 'utf8');
+}
+
+function sanitizeCharacterOverride(input) {
+  const next = {};
+  const src = input && typeof input === 'object' ? input : {};
+  if (src.name !== undefined) next.name = String(src.name || '').trim().slice(0, 80);
+  if (src.description !== undefined) next.description = String(src.description || '').trim().slice(0, 2000);
+  if (src.bio !== undefined) next.bio = String(src.bio || '').trim().slice(0, 4000);
+  if (src.status_text !== undefined) next.status_text = String(src.status_text || '').trim().slice(0, 120);
+  if (src.avatar_url !== undefined) next.avatar_url = isHttpUrl(src.avatar_url) ? String(src.avatar_url).trim() : '';
+  if (src.banner_url !== undefined) next.banner_url = isHttpUrl(src.banner_url) ? String(src.banner_url).trim() : '';
+  if (src.room_id !== undefined) next.room_id = String(src.room_id || '').trim().slice(0, 120);
+  if (src.api_key !== undefined) next.api_key = String(src.api_key || '').trim().slice(0, 512);
+  if (src.bot_token !== undefined) next.bot_token = String(src.bot_token || '').trim().slice(0, 512);
+  return next;
+}
+
+function applyCharacterOverride(character, override) {
+  if (!override || typeof override !== 'object') return character;
+  return {
+    ...character,
+    name: override.name !== undefined && override.name !== '' ? String(override.name).trim().slice(0, 80) : character.name,
+    description: override.description !== undefined ? String(override.description || '').trim().slice(0, 2000) : character.description,
+    bio: override.bio !== undefined ? String(override.bio || '').trim().slice(0, 4000) : character.bio,
+    status_text: override.status_text !== undefined ? String(override.status_text || '').trim().slice(0, 120) : character.status_text,
+    avatar_url: override.avatar_url !== undefined ? (isHttpUrl(override.avatar_url) ? String(override.avatar_url).trim() : '') : character.avatar_url,
+    banner_url: override.banner_url !== undefined ? (isHttpUrl(override.banner_url) ? String(override.banner_url).trim() : '') : character.banner_url,
+    room_id: override.room_id !== undefined ? String(override.room_id || '').trim().slice(0, 120) : character.room_id,
+    api_key: override.api_key !== undefined ? String(override.api_key || '').trim().slice(0, 512) : (character.api_key || ''),
+    bot_token: override.bot_token !== undefined ? String(override.bot_token || '').trim().slice(0, 512) : (character.bot_token || '')
+  };
 }
 
 async function stRequest(pathOrUrl, options = {}) {
@@ -278,6 +336,8 @@ function buildSyncSummary(result) {
   return parts.join(' | ');
 }
 
+// --- Routes ---
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'dreamcord-sillytavern-bridge', configured: hasBridgeConfig() });
 });
@@ -300,6 +360,79 @@ app.get('/mappings', async (_req, res) => {
   }
 });
 
+app.get('/characters/preview', async (_req, res) => {
+  try {
+    if (!hasBridgeConfig()) {
+      return res.status(400).json({ error: 'Bridge not configured. Fill env vars first.' });
+    }
+    const [rawCharacters, map, overrides, apps] = await Promise.all([
+      fetchSillyCharacters(),
+      loadCharacterMap(),
+      loadCharacterOverrides(),
+      dcAdminJson('/admin/dev-portal/apps')
+    ]);
+    const appList = Array.isArray(apps) ? apps : [];
+    const byId = new Map(appList.map((a) => [String(a.id), a]));
+    const byName = new Map(appList.map((a) => [String(a.name || '').toLowerCase(), a]));
+    const rows = rawCharacters
+      .map(normalizeCharacter)
+      .filter(Boolean)
+      .map((c) => {
+        const sourceId = String(c.source_id);
+        const override = overrides[sourceId] || null;
+        const merged = applyCharacterOverride(c, override);
+        const mappedId = String(map[sourceId] || '').trim();
+        const app = mappedId ? byId.get(mappedId) : (byName.get(String(merged.name || '').toLowerCase()) || null);
+        return {
+          source_id: sourceId,
+          character: merged,
+          override,
+          mapped_app_id: app?.id || mappedId || null,
+          mapped_app_name: app?.name || null,
+          mapped_active: app?.is_active === true
+        };
+      });
+    res.json({ ok: true, total: rows.length, rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || 'Could not build preview' });
+  }
+});
+
+app.put('/characters/:sourceId/override', async (req, res) => {
+  try {
+    const sourceId = String(req.params.sourceId || '').trim();
+    if (!sourceId) return res.status(400).json({ error: 'sourceId is required' });
+    const patch = sanitizeCharacterOverride(req.body || {});
+    const overrides = await loadCharacterOverrides();
+    const next = { ...(overrides[sourceId] || {}), ...patch };
+    const compact = Object.fromEntries(
+      Object.entries(next).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
+    );
+    if (Object.keys(compact).length === 0) {
+      delete overrides[sourceId];
+    } else {
+      overrides[sourceId] = compact;
+    }
+    await saveCharacterOverrides(overrides);
+    res.json({ ok: true, source_id: sourceId, override: overrides[sourceId] || null });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || 'Could not save override' });
+  }
+});
+
+app.delete('/characters/:sourceId/override', async (req, res) => {
+  try {
+    const sourceId = String(req.params.sourceId || '').trim();
+    if (!sourceId) return res.status(400).json({ error: 'sourceId is required' });
+    const overrides = await loadCharacterOverrides();
+    delete overrides[sourceId];
+    await saveCharacterOverrides(overrides);
+    res.json({ ok: true, source_id: sourceId });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message || 'Could not clear override' });
+  }
+});
+
 app.post('/sync/characters', async (req, res) => {
   try {
     if (!hasBridgeConfig()) {
@@ -313,7 +446,11 @@ app.post('/sync/characters', async (req, res) => {
     const targetChannelId = String(req.body?.target_channel_id || DEFAULT_TARGET_CHANNEL_ID || '').trim();
 
     const rawCharacters = await fetchSillyCharacters();
-    const normalized = rawCharacters.map(normalizeCharacter).filter(Boolean);
+    const overrides = await loadCharacterOverrides();
+    const normalized = rawCharacters
+      .map(normalizeCharacter)
+      .filter(Boolean)
+      .map((c) => applyCharacterOverride(c, overrides[String(c.source_id)]));
     const dedup = new Map();
     normalized.forEach((c) => {
       const key = String(c.source_id || slugify(c.name));
@@ -339,71 +476,69 @@ app.post('/sync/characters', async (req, res) => {
     };
 
     for (const ch of sourceChars) {
-      const mappedId = String(map[ch.source_id] || '').trim();
-      let appRow = mappedId ? byId.get(mappedId) : null;
-      if (!appRow) appRow = byName.get(ch.name.toLowerCase()) || null;
+      try {
+        const mappedId = String(map[ch.source_id] || '').trim();
+        let appRow = mappedId ? byId.get(mappedId) : null;
+        if (!appRow) appRow = byName.get(ch.name.toLowerCase()) || null;
 
-      if (!appRow) {
-        if (!createMissing) {
-          result.unchanged.push({ source_id: ch.source_id, name: ch.name, reason: 'create_missing=false' });
+        if (!appRow) {
+          if (!createMissing) {
+            result.unchanged.push({ source_id: ch.source_id, name: ch.name, reason: 'create_missing=false' });
+            continue;
+          }
+          if (dryRun) {
+            result.created.push({ source_id: ch.source_id, name: ch.name, planned: true });
+            continue;
+          }
+          const created = await dcAdminJson('/admin/dev-portal/apps', {
+            method: 'POST',
+            body: JSON.stringify({ ...toAppPatch(ch), owner_id: null })
+          });
+          const createdApp = created?.app || created;
+          if (!createdApp?.id) throw new Error(`Create app failed for "${ch.name}"`);
+          map[ch.source_id] = createdApp.id;
+          byId.set(String(createdApp.id), createdApp);
+          byName.set(ch.name.toLowerCase(), createdApp);
+          result.created.push({ source_id: ch.source_id, app_id: createdApp.id, name: ch.name });
           continue;
         }
+
+        map[ch.source_id] = appRow.id;
+        if (!updateExisting) {
+          result.unchanged.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, reason: 'update_existing=false' });
+          continue;
+        }
+
+        const patch = toAppPatch(ch);
+        const hasMeaningfulChange =
+          String(appRow.name || '') !== String(patch.name || '') ||
+          String(appRow.description || '') !== String(patch.description || '') ||
+          String(appRow.bio || '') !== String(patch.bio || '') ||
+          String(appRow.status_text || '') !== String(patch.status_text || '') ||
+          String(appRow.avatar_url || '') !== String(patch.avatar_url || '') ||
+          String(appRow.banner_url || '') !== String(patch.banner_url || '') ||
+          String(appRow.profile_source_label || '') !== String(patch.profile_source_label || '') ||
+          Boolean(appRow.profile_hide_room) !== Boolean(patch.profile_hide_room) ||
+          String(appRow.nomi_room_default || '') !== String(patch.nomi_room_default || '');
+
+        if (!hasMeaningfulChange) {
+          result.unchanged.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, reason: 'no_changes' });
+          continue;
+        }
+
         if (dryRun) {
-          result.created.push({ source_id: ch.source_id, name: ch.name, planned: true });
+          result.updated.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, planned: true });
           continue;
         }
-        const created = await dcAdminJson('/admin/dev-portal/apps', {
-          method: 'POST',
-          body: JSON.stringify({
-            ...toAppPatch(ch),
-            owner_id: null
-          })
+
+        await dcAdminJson(`/admin/dev-portal/apps/${appRow.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(patch)
         });
-        const createdApp = created?.app || created;
-        if (!createdApp?.id) throw new Error(`Create app failed for "${ch.name}"`);
-        map[ch.source_id] = createdApp.id;
-        byId.set(String(createdApp.id), createdApp);
-        byName.set(ch.name.toLowerCase(), createdApp);
-        result.created.push({ source_id: ch.source_id, app_id: createdApp.id, name: ch.name });
-        continue;
+        result.updated.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name });
+      } catch (err) {
+        result.errors.push({ source_id: ch.source_id, name: ch.name, error: err.message || String(err) });
       }
-
-      map[ch.source_id] = appRow.id;
-      if (!updateExisting) {
-        result.unchanged.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, reason: 'update_existing=false' });
-        continue;
-      }
-
-      const patch = toAppPatch(ch);
-      const hasMeaningfulChange =
-        String(appRow.name || '') !== String(patch.name || '') ||
-        String(appRow.description || '') !== String(patch.description || '') ||
-        String(appRow.bio || '') !== String(patch.bio || '') ||
-        String(appRow.status_text || '') !== String(patch.status_text || '') ||
-        String(appRow.avatar_url || '') !== String(patch.avatar_url || '') ||
-        String(appRow.banner_url || '') !== String(patch.banner_url || '') ||
-        String(appRow.profile_source_label || '') !== String(patch.profile_source_label || '') ||
-        Boolean(appRow.profile_hide_room) !== Boolean(patch.profile_hide_room) ||
-        String(appRow.nomi_room_default || '') !== String(patch.nomi_room_default || '');
-
-      if (!hasMeaningfulChange) {
-        result.unchanged.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, reason: 'no_changes' });
-        continue;
-      }
-
-      if (dryRun) {
-        result.updated.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name, planned: true });
-        continue;
-      }
-
-      const updated = await dcAdminJson(`/admin/dev-portal/apps/${appRow.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(patch)
-      });
-      const updatedApp = updated?.app || updated || appRow;
-      byId.set(String(appRow.id), updatedApp);
-      byName.set(ch.name.toLowerCase(), updatedApp);
-      result.updated.push({ source_id: ch.source_id, app_id: appRow.id, name: ch.name });
     }
 
     if (disableMissing) {

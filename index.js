@@ -1,8 +1,11 @@
 (() => {
   const NS = 'dreamcord-sillytavern-bridge';
-  const API = '/api/plugins/dreamcord-sillytavern-bridge';
+  const ST_PLUGIN_API = '/api/plugins/dreamcord-sillytavern-bridge';
+  const STANDALONE_PORTS = [3710, 3711];
 
+  let API = ST_PLUGIN_API;
   let rows = [];
+  let apiResolved = false;
 
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -33,11 +36,12 @@
   }
 
   async function jget(path) {
+    await resolveApi();
+    const isStPlugin = API === ST_PLUGIN_API;
     const res = await fetch(`${API}${path}`, {
-      credentials: 'include',
-      headers: {
-        ...getStHeaders()
-      }
+      credentials: isStPlugin ? 'include' : 'omit',
+      mode: isStPlugin ? 'same-origin' : 'cors',
+      headers: isStPlugin ? { ...getStHeaders() } : { Accept: 'application/json' }
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
@@ -45,12 +49,15 @@
   }
 
   async function jsend(path, method, body) {
+    await resolveApi();
+    const isStPlugin = API === ST_PLUGIN_API;
     const res = await fetch(`${API}${path}`, {
       method,
-      credentials: 'include',
+      credentials: isStPlugin ? 'include' : 'omit',
+      mode: isStPlugin ? 'same-origin' : 'cors',
       headers: {
         'Content-Type': 'application/json',
-        ...getStHeaders()
+        ...(isStPlugin ? getStHeaders() : { Accept: 'application/json' })
       },
       body: body ? JSON.stringify(body) : undefined
     });
@@ -242,6 +249,38 @@
     loadPreview();
   }
 
+  async function resolveApi() {
+    if (apiResolved) return;
+    // Try the ST plugin path first
+    try {
+      const res = await fetch(`${ST_PLUGIN_API}/health`, {
+        credentials: 'include',
+        headers: getStHeaders()
+      });
+      if (res.ok) {
+        API = ST_PLUGIN_API;
+        apiResolved = true;
+        console.log(`[${NS}] using ST plugin API`);
+        return;
+      }
+    } catch (_) {}
+    // Probe standalone bridge on common ports
+    const origin = window.location.origin.replace(/:\d+$/, '');
+    for (const port of STANDALONE_PORTS) {
+      try {
+        const base = `${origin}:${port}`;
+        const res = await fetch(`${base}/health`, { mode: 'cors' });
+        if (res.ok) {
+          API = base;
+          apiResolved = true;
+          console.log(`[${NS}] using standalone bridge at ${base}`);
+          return;
+        }
+      } catch (_) {}
+    }
+    console.warn(`[${NS}] no bridge API found — ST plugin 404 and standalone not reachable`);
+  }
+
   function start() {
     mountUi();
     const observer = new MutationObserver(() => {
@@ -249,6 +288,7 @@
     });
     observer.observe(document.body, { childList: true, subtree: true });
     console.log(`[${NS}] settings panel mounted`);
+    resolveApi();
   }
 
   if (document.readyState === 'loading') {
