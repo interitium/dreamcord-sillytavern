@@ -1,10 +1,10 @@
 (() => {
   const NS = 'dreamcord-bot-bridge';
-  const ST_PLUGIN_APIS = ['/api/plugins/dreamcord-bot-bridge', '/api/plugins/dreamcord-sillytavern-bridge'];
+  const ST_PLUGIN_API = '/api/plugins/dreamcord-bot-bridge';
   const STANDALONE_PORTS = [3710, 3711];
   const PANEL_COLLAPSED_KEY = 'dcst.panelCollapsed.v1';
 
-  let API = ST_PLUGIN_APIS[0];
+  let API = ST_PLUGIN_API;
   let rows = [];
   let searchTerm = '';
   let apiResolved = false;
@@ -50,7 +50,7 @@
 
   async function jget(path) {
     await resolveApi();
-    const isStPlugin = ST_PLUGIN_APIS.includes(API);
+    const isStPlugin = API === ST_PLUGIN_API;
     const csrf = isStPlugin ? await getFreshCsrfToken() : '';
     const res = await fetch(`${API}${path}`, {
       credentials: isStPlugin ? 'include' : 'omit',
@@ -64,7 +64,7 @@
 
   async function jsend(path, method, body) {
     await resolveApi();
-    const isStPlugin = ST_PLUGIN_APIS.includes(API);
+    const isStPlugin = API === ST_PLUGIN_API;
     const csrf = isStPlugin ? await getFreshCsrfToken() : '';
     const res = await fetch(`${API}${path}`, {
       method,
@@ -571,20 +571,18 @@
   async function resolveApi() {
     if (apiResolved) return;
     // Try the ST plugin path first
-    for (const pluginApi of ST_PLUGIN_APIS) {
-      try {
-        const res = await fetch(`${pluginApi}/health`, {
-          credentials: 'include',
-          headers: getStHeaders()
-        });
-        if (res.ok) {
-          API = pluginApi;
-          apiResolved = true;
-          console.log(`[${NS}] using ST plugin API ${pluginApi}`);
-          return;
-        }
-      } catch (_) {}
-    }
+    try {
+      const res = await fetch(`${ST_PLUGIN_API}/health`, {
+        credentials: 'include',
+        headers: getStHeaders()
+      });
+      if (res.ok) {
+        API = ST_PLUGIN_API;
+        apiResolved = true;
+        console.log(`[${NS}] using ST plugin API ${ST_PLUGIN_API}`);
+        return;
+      }
+    } catch (_) {}
     // Probe standalone bridge on common ports
     const origin = window.location.origin.replace(/:\d+$/, '');
     for (const port of STANDALONE_PORTS) {

@@ -7,7 +7,7 @@
   "js": "index.js",
   "author": "Interitium",
   "version": "0.2.0",
-  "homePage": "https://github.com/interitium/dreamcord-sillytavern",
+  "homePage": "https://github.com/interitium/dreamcord-bot-bridge",
   "auto_update": true,
   "minimum_client_version": "1.0.0"
 }
